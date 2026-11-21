@@ -1,0 +1,111 @@
+name: 构建鸿蒙 ARM64 内核基线
+
+on:
+  push:
+    branches: [ci/ohos-core-baseline]
+    paths: [.github/workflows/ohos-core-baseline.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 获取固定版本的桥接源码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: xiaobaigroup/ClashBox
+          ref: e036a6a3097192ff74987ce7306eea2a03d6a3ac
+          persist-credentials: false
+          path: source
+      - name: 准备鸿蒙 NDK
+        id: ohos
+        uses: openharmony-rs/setup-ohos-sdk@b312caf8a43bb836aa24c08f65f97e1f09a89cad
+        with:
+          version: 5.0.0
+          components: native
+      - name: 准备引导 Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: '1.24.13'
+          cache: false
+      - name: 获取固定依赖并构建定制 Go
+        shell: bash
+        env:
+          GOTOOLCHAIN: local
+        run: |
+          fetch_revision() {
+            local url="$1" revision="$2" target="$3"
+            git init --quiet "$target"
+            git -C "$target" fetch --quiet --depth 1 "$url" "$revision"
+            git -C "$target" checkout --quiet --detach FETCH_HEAD
+            test "$(git -C "$target" rev-parse HEAD)" = "$revision"
+          }
+          fetch_revision https://github.com/xfz347/Clash.Meta.git 98ca8a7bf1737001d5488baf93223c9878e532a7 source/proxy_core/src/flclash/core
+          fetch_revision https://github.com/likuai2010/gvisor-ohos.git 82104eaba946b7cc463b87648af9724d3f268537 source/proxy_core/src/flclash/gvisor-ohos
+          fetch_revision https://github.com/moodyhunter/go-tls-mode-gd.git 0136c5054dec5322f49a4d5431a610b972c44b4f "$RUNNER_TEMP/go-ohos"
+          grep -q tlsmodegd "$RUNNER_TEMP/go-ohos/src/cmd/go/internal/work/build.go"
+          export GOROOT_BOOTSTRAP="$(go env GOROOT)"
+          (cd "$RUNNER_TEMP/go-ohos/src" && bash make.bash)
+          "$RUNNER_TEMP/go-ohos/bin/go" version
+      - name: 编译并校验 ARM64 共享库
+        working-directory: source/proxy_core/src/flclash
+        shell: bash
+        env:
+          OHOS_NATIVE: ${{ steps.ohos.outputs.ohos_sdk_native }}
+          GOTOOLCHAIN: local
+        run: |
+          test -d "$OHOS_NATIVE/sysroot"
+          go_ohos="$RUNNER_TEMP/go-ohos/bin/go"
+          cat > core/component/iface/zz_flclash_compat.go <<'EOF'
+          package iface
+          import "net"
+          func SetNetInterfaces(nets []net.Interface) { setNetInterfaces(nets) }
+          EOF
+          cat > core/tunnel/statistic/zz_flclash_compat.go <<'EOF'
+          package statistic
+          func (m *Manager) NowTraffic(onlyProxy bool) (up, down int64) { return m.Current(onlyProxy) }
+          func (m *Manager) TotalTraffic(onlyProxy bool) (up, down int64) { return m.Total(onlyProxy) }
+          EOF
+          mv go.mod "$RUNNER_TEMP/flclash-original.go.mod"
+          mv go.sum "$RUNNER_TEMP/flclash-original.go.sum"
+          "$go_ohos" mod init core
+          "$go_ohos" mod edit -go=1.23 \
+            -require=github.com/likuai2010/ohos-napi@v1.0.3 \
+            -require=github.com/metacubex/mihomo@v1.17.1 \
+            -require=github.com/samber/lo@v1.53.0 \
+            -replace=github.com/metacubex/mihomo=./core \
+            -replace=github.com/metacubex/gvisor=./gvisor-ohos
+          GOFLAGS=-tags=ohos,with_gvisor "$go_ohos" mod tidy
+          export GOOS=linux GOARCH=arm64 CGO_ENABLED=1
+          export CC="$OHOS_NATIVE/llvm/bin/clang" CXX="$OHOS_NATIVE/llvm/bin/clang++" CGO_AR="$OHOS_NATIVE/llvm/bin/llvm-ar"
+          export CGO_CFLAGS="--target=aarch64-linux-ohos --sysroot=$OHOS_NATIVE/sysroot -D__MUSL__ -fPIC -Wno-error"
+          export CGO_LDFLAGS="--target=aarch64-linux-ohos --sysroot=$OHOS_NATIVE/sysroot -fuse-ld=lld"
+          output="$GITHUB_WORKSPACE/ohos-core-artifact"
+          mkdir -p "$output"
+          "$go_ohos" build -mod=mod -tlsmodegd -buildmode=c-shared -tags 'ohos with_gvisor' -trimpath -ldflags '-s -w' -o "$output/libflclash.so" ./
+          cd "$output"
+          header=$(readelf -h libflclash.so)
+          dynamic=$(readelf -d libflclash.so)
+          symbols=$(readelf --dyn-syms --wide libflclash.so)
+          grep -F 'ELF64' <<< "$header"
+          grep -F 'AArch64' <<< "$header"
+          grep -F 'DYN (Shared object file)' <<< "$header"
+          grep -E '[[:space:]]InitializeModule$' <<< "$symbols"
+          for lib in libhilog_ndk.z.so libace_napi.z.so libc.so; do
+            grep -F "Shared library: [$lib]" <<< "$dynamic"
+          done
+          if grep -F '(TEXTREL)' <<< "$dynamic"; then exit 1; fi
+          sha256sum libflclash.so > SHA256SUMS
+      - name: 上传基线产物
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ohos-core-baseline-arm64
+          path: |
+            ohos-core-artifact/libflclash.so
+            ohos-core-artifact/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
