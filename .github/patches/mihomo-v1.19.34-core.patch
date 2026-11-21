@@ -1,0 +1,1444 @@
+diff --git a/adapter/adapter.go b/adapter/adapter.go
+--- a/adapter/adapter.go
++++ b/adapter/adapter.go
+@@ -21,6 +21,11 @@
+ )
+ 
+ var UnifiedDelay = atomic.NewBool(false)
++
++type UrlTestCheck func(url string, name string, delay uint16)
++
++// UrlTestHook 在测速历史更新后调用；使用 Store 注册，传 nil 清除。回调可能并发执行。
++var UrlTestHook atomic.TypedValue[UrlTestCheck]
+ 
+ const (
+ 	defaultHistoriesNum = 10
+@@ -197,6 +202,9 @@
+ 			state.history.Pop()
+ 		}
+ 
++		if hook := UrlTestHook.Load(); hook != nil {
++			hook(url, p.Name(), t)
++		}
+ 	}()
+ 
+ 	unifiedDelay := UnifiedDelay.Load()
+diff --git a/adapter/outboundgroup/parser.go b/adapter/outboundgroup/parser.go
+--- a/adapter/outboundgroup/parser.go
++++ b/adapter/outboundgroup/parser.go
+@@ -144,7 +144,7 @@
+ 				}
+ 			}
+ 			if groupOption.URL == "" {
+-				groupOption.URL = C.DefaultTestURL
++				groupOption.URL = C.TestURL()
+ 			}
+ 		} else {
+ 			addTestUrlToProviders(PDs, groupOption.URL, expectedStatus, groupOption.Filter, uint(groupOption.Interval))
+@@ -163,7 +163,7 @@
+ 		}
+ 
+ 		if groupOption.URL == "" {
+-			groupOption.URL = C.DefaultTestURL
++			groupOption.URL = C.TestURL()
+ 		}
+ 
+ 		// select don't need auto health check
+diff --git a/adapter/outboundgroup/selector.go b/adapter/outboundgroup/selector.go
+--- a/adapter/outboundgroup/selector.go
++++ b/adapter/outboundgroup/selector.go
+@@ -61,7 +61,7 @@
+ 	// When testurl is the default value
+ 	// do not append a value to ensure that the web dashboard follows the settings of the dashboard
+ 	var url string
+-	if s.testUrl != C.DefaultTestURL {
++	if s.testUrl != C.TestURL() {
+ 		url = s.testUrl
+ 	}
+ 
+diff --git a/adapter/provider/provider.go b/adapter/provider/provider.go
+--- a/adapter/provider/provider.go
++++ b/adapter/provider/provider.go
+@@ -136,8 +136,22 @@
+ 		TestUrl:          pp.healthCheck.url,
+ 		ExpectedStatus:   pp.healthCheck.expectedStatus.String(),
+ 		UpdatedAt:        pp.UpdatedAt(),
+-		SubscriptionInfo: pp.subscriptionInfo,
++		SubscriptionInfo: pp.GetSubscriptionInfo(),
+ 	})
++}
++
++// GetSubscriptionInfo 返回 provider 当前的订阅信息，未加载时返回 nil。
++func (pp *proxySetProvider) GetSubscriptionInfo() *SubscriptionInfo {
++	pp.mutex.RLock()
++	defer pp.mutex.RUnlock()
++	return pp.subscriptionInfo
++}
++
++func (pp *proxySetProvider) setSubscriptionInfo(userInfo string) {
++	info := NewSubscriptionInfo(userInfo)
++	pp.mutex.Lock()
++	pp.subscriptionInfo = info
++	pp.mutex.Unlock()
+ }
+ 
+ func (pp *proxySetProvider) Name() string {
+@@ -158,7 +172,7 @@
+ 		return err
+ 	}
+ 	if subscriptionInfo := cachefile.Cache().GetSubscriptionInfo(pp.Name()); subscriptionInfo != "" {
+-		pp.subscriptionInfo = NewSubscriptionInfo(subscriptionInfo)
++		pp.setSubscriptionInfo(subscriptionInfo)
+ 	}
+ 	pp.closeAllConnections()
+ 	return nil
+@@ -211,7 +225,7 @@
+ 		httpVehicle.SetInRead(func(resp *http.Response) {
+ 			if subscriptionInfo := resp.Header.Get("subscription-userinfo"); subscriptionInfo != "" {
+ 				cachefile.Cache().SetSubscriptionInfo(name, subscriptionInfo)
+-				pd.subscriptionInfo = NewSubscriptionInfo(subscriptionInfo)
++				pd.setSubscriptionInfo(subscriptionInfo)
+ 			}
+ 		})
+ 	}
+diff --git a/component/iface/iface.go b/component/iface/iface.go
+--- a/component/iface/iface.go
++++ b/component/iface/iface.go
+@@ -34,9 +34,68 @@
+ 
+ var caches = singledo.NewSingle[*ifaceCache](time.Second * 20)
+ 
++func readInterface(ifi *net.Interface) (*Interface, error) {
++	result := &Interface{
++		Index:        ifi.Index,
++		MTU:          ifi.MTU,
++		Name:         ifi.Name,
++		HardwareAddr: ifi.HardwareAddr,
++		Flags:        ifi.Flags,
++	}
++	addrs, err := anet.InterfaceAddrsByInterface(ifi)
++	if err != nil {
++		return result, err
++	}
++
++	result.Addresses = make([]netip.Prefix, 0, len(addrs))
++	for _, addr := range addrs {
++		var prefix netip.Prefix
++		switch ipNet := addr.(type) {
++		case *net.IPNet:
++			ip, _ := netip.AddrFromSlice(ipNet.IP)
++			ones, bits := ipNet.Mask.Size()
++			if bits == 32 {
++				ip = ip.Unmap()
++			}
++			prefix = netip.PrefixFrom(ip, ones)
++		case *net.IPAddr:
++			ip, _ := netip.AddrFromSlice(ipNet.IP)
++			ip = ip.Unmap()
++			prefix = netip.PrefixFrom(ip, ip.BitLen())
++		}
++		if prefix.IsValid() {
++			result.Addresses = append(result.Addresses, prefix)
++		}
++	}
++	return result, nil
++}
++
++var loadInterfaces = func() ([]*Interface, error) {
++	return readSystemInterfaces(nil)
++}
++
++func readSystemInterfaces(onAddrError func(*Interface)) ([]*Interface, error) {
++	ifaces, err := anet.Interfaces()
++	if err != nil {
++		return nil, err
++	}
++	result := make([]*Interface, 0, len(ifaces))
++	for i := range ifaces {
++		ifi, err := readInterface(&ifaces[i])
++		if err != nil {
++			if onAddrError == nil {
++				continue
++			}
++			onAddrError(ifi)
++		}
++		result = append(result, ifi)
++	}
++	return result, nil
++}
++
+ func getCache() (*ifaceCache, error) {
+ 	value, err, _ := caches.Do(func() (*ifaceCache, error) {
+-		ifaces, err := anet.Interfaces()
++		ifaces, err := loadInterfaces()
+ 		if err != nil {
+ 			return nil, err
+ 		}
+@@ -45,50 +104,14 @@
+ 			ifMapByName: make(map[string]*Interface),
+ 			ifMapByAddr: make(map[netip.Addr]*Interface),
+ 		}
+-
+-		for _, iface := range ifaces {
+-			addrs, err := anet.InterfaceAddrsByInterface(&iface)
+-			if err != nil {
++		for _, ifi := range ifaces {
++			cache.ifMapByName[ifi.Name] = ifi
++			if ifi.Flags&net.FlagUp == 0 {
+ 				continue
+ 			}
+-
+-			ipNets := make([]netip.Prefix, 0, len(addrs))
+-			for _, addr := range addrs {
+-				var pf netip.Prefix
+-				switch ipNet := addr.(type) {
+-				case *net.IPNet:
+-					ip, _ := netip.AddrFromSlice(ipNet.IP)
+-					ones, bits := ipNet.Mask.Size()
+-					if bits == 32 {
+-						ip = ip.Unmap()
+-					}
+-					pf = netip.PrefixFrom(ip, ones)
+-				case *net.IPAddr:
+-					ip, _ := netip.AddrFromSlice(ipNet.IP)
+-					ip = ip.Unmap()
+-					pf = netip.PrefixFrom(ip, ip.BitLen())
+-				}
+-				if pf.IsValid() {
+-					ipNets = append(ipNets, pf)
+-				}
+-			}
+-
+-			ifaceObj := &Interface{
+-				Index:        iface.Index,
+-				MTU:          iface.MTU,
+-				Name:         iface.Name,
+-				HardwareAddr: iface.HardwareAddr,
+-				Flags:        iface.Flags,
+-				Addresses:    ipNets,
+-			}
+-			cache.ifMapByName[iface.Name] = ifaceObj
+-
+-			if iface.Flags&net.FlagUp == 0 {
+-				continue // interface down
+-			}
+-			for _, prefix := range ipNets {
+-				cache.ifMapByAddr[prefix.Addr()] = ifaceObj
+-				cache.ifTable.Insert(prefix, ifaceObj)
++			for _, prefix := range ifi.Addresses {
++				cache.ifMapByAddr[prefix.Addr()] = ifi
++				cache.ifTable.Insert(prefix, ifi)
+ 			}
+ 		}
+ 
+diff --git a/component/iface/iface_injected_linux.go b/component/iface/iface_injected_linux.go
+new file mode 100644
+--- /dev/null
++++ b/component/iface/iface_injected_linux.go
+@@ -0,0 +1,96 @@
++//go:build linux && ohos
++
++package iface
++
++import (
++	"net"
++	"net/netip"
++	"sync/atomic"
++)
++
++type interfaceSnapshot struct {
++	interfaces []*Interface
++	byName     map[string]*Interface
++}
++
++var systemSnapshot atomic.Pointer[interfaceSnapshot]
++
++func init() {
++	loadInterfaces = loadOHOSInterfaces
++}
++
++// SetNetInterfaces 注入系统接口及其本机地址快照；空列表清除快照。
++func SetNetInterfaces(interfaces []Interface) {
++	snapshot := &interfaceSnapshot{byName: make(map[string]*Interface, len(interfaces))}
++	for _, ifi := range interfaces {
++		if ifi.Name == "" || ifi.Index <= 0 || snapshot.byName[ifi.Name] != nil {
++			continue
++		}
++		copyOfInterface := ifi
++		copyOfInterface.HardwareAddr = append(net.HardwareAddr(nil), ifi.HardwareAddr...)
++		copyOfInterface.Addresses = nil
++		for _, prefix := range ifi.Addresses {
++			if prefix.IsValid() {
++				copyOfInterface.Addresses = append(copyOfInterface.Addresses, prefix)
++			}
++		}
++		snapshot.interfaces = append(snapshot.interfaces, &copyOfInterface)
++		snapshot.byName[ifi.Name] = &copyOfInterface
++	}
++	systemSnapshot.Store(snapshot)
++	FlushCache()
++}
++
++// SetNetInterfacesByName 仅用接口名查找系统接口，不把邻居地址当作本机地址。
++func SetNetInterfacesByName(names []string) error {
++	interfaces := make([]Interface, 0, len(names))
++	seen := make(map[string]bool, len(names))
++	var lookupErr error
++	for _, name := range names {
++		if name == "" || seen[name] {
++			continue
++		}
++		seen[name] = true
++		ifi, err := net.InterfaceByName(name)
++		if err != nil {
++			lookupErr = err
++			continue
++		}
++		// 即使地址不可读，也保留真实接口，以便按名称或索引查找。
++		systemInterface, _ := readInterface(ifi)
++		interfaces = append(interfaces, *systemInterface)
++	}
++	if len(names) != 0 && len(interfaces) == 0 {
++		if lookupErr != nil {
++			return lookupErr
++		}
++		return ErrIfaceNotFound
++	}
++	SetNetInterfaces(interfaces)
++	return nil
++}
++
++func loadOHOSInterfaces() ([]*Interface, error) {
++	snapshot := systemSnapshot.Load()
++	interfaces, err := readSystemInterfaces(func(ifi *Interface) {
++		if snapshot == nil {
++			return
++		}
++		if cached := snapshot.byName[ifi.Name]; cached != nil && cached.Index == ifi.Index {
++			ifi.Addresses = append([]netip.Prefix(nil), cached.Addresses...)
++		}
++	})
++	// 默认网卡检测依赖实时接口列表，不能用不完整的邻居表快照覆盖它。
++	if len(interfaces) != 0 || snapshot == nil || len(snapshot.interfaces) == 0 {
++		return interfaces, err
++	}
++
++	interfaces = make([]*Interface, 0, len(snapshot.interfaces))
++	for _, cached := range snapshot.interfaces {
++		ifi := *cached
++		ifi.HardwareAddr = append(net.HardwareAddr(nil), cached.HardwareAddr...)
++		ifi.Addresses = append([]netip.Prefix(nil), cached.Addresses...)
++		interfaces = append(interfaces, &ifi)
++	}
++	return interfaces, nil
++}
+diff --git a/component/updater/update_geo.go b/component/updater/update_geo.go
+--- a/component/updater/update_geo.go
++++ b/component/updater/update_geo.go
+@@ -5,6 +5,7 @@
+ 	"errors"
+ 	"fmt"
+ 	"os"
++	"path/filepath"
+ 	"runtime"
+ 	"time"
+ 
+@@ -44,8 +45,106 @@
+ 	updateInterval = newGeoUpdateInterval
+ }
+ 
+-func UpdateMMDB() (err error) {
+-	vehicle := resource.NewHTTPVehicle(geodata.MmdbUrl(), C.Path.MMDB(), "", nil, defaultHttpTimeout, 0)
++// geoUpdatePath 返回经校验的写入路径，以及它是否指向核心当前使用的默认库。
++func geoUpdatePath(path, defaultPath string) (string, bool, error) {
++	if path == "" {
++		if defaultPath == "" {
++			return "", false, errors.New("GEO database default path is unavailable")
++		}
++		return defaultPath, true, nil
++	}
++	path, err := filepath.Abs(C.Path.Resolve(path))
++	if err != nil {
++		return "", false, err
++	}
++	if !C.Path.IsSafePath(path) {
++		return "", false, C.Path.ErrNotSafePath(path)
++	}
++	resolved, err := resolveGeoUpdatePath(path)
++	if err != nil {
++		return "", false, err
++	}
++	if resolved != path && !isSafeResolvedGeoPath(path, resolved) {
++		return "", false, C.Path.ErrNotSafePath(path)
++	}
++
++	info, err := os.Stat(resolved)
++	if err != nil && !os.IsNotExist(err) {
++		return "", false, err
++	}
++	if home, _ := filepath.Abs(C.Path.HomeDir()); path == home || (info != nil && !info.Mode().IsRegular()) {
++		return "", false, fmt.Errorf("GEO database destination is not a regular file: %s", path)
++	}
++	return resolved, isDefaultGeoPath(resolved, defaultPath, info), nil
++}
++
++func resolveGeoUpdatePath(path string) (string, error) {
++	// 新文件可能尚不存在，沿父目录查找已存在的部分，再拼回未创建的路径。
++	for probe := path; ; probe = filepath.Dir(probe) {
++		if _, err := os.Lstat(probe); err != nil {
++			if os.IsNotExist(err) && probe != filepath.Dir(probe) {
++				continue
++			}
++			return "", err
++		}
++		resolved, err := filepath.EvalSymlinks(probe)
++		if err != nil {
++			return "", err
++		}
++		rel, err := filepath.Rel(probe, path)
++		if err != nil {
++			return "", err
++		}
++		return filepath.Join(resolved, rel), nil
++	}
++}
++
++func isSafeResolvedGeoPath(path, resolved string) bool {
++	if C.Path.IsSafePath(resolved) {
++		return true
++	}
++	// 允许目录本身可能是符号链接；解析后的路径仍须位于同一允许目录内。
++	for _, root := range C.Path.SafePaths() {
++		if rel, err := filepath.Rel(root, path); err != nil || !filepath.IsLocal(rel) {
++			continue
++		}
++		if realRoot, err := filepath.EvalSymlinks(root); err == nil {
++			if rel, err := filepath.Rel(realRoot, resolved); err == nil && filepath.IsLocal(rel) {
++				return true
++			}
++		}
++	}
++	return false
++}
++
++func isDefaultGeoPath(path, defaultPath string, info os.FileInfo) bool {
++	if defaultPath == "" {
++		return false
++	}
++	abs, err := filepath.Abs(defaultPath)
++	if err == nil {
++		if path == abs {
++			return true
++		}
++		if resolved, err := resolveGeoUpdatePath(abs); err == nil && path == resolved {
++			return true
++		}
++	}
++	defaultInfo, err := os.Stat(defaultPath)
++	return err == nil && info != nil && os.SameFile(info, defaultInfo)
++}
++
++func UpdateMMDB() error {
++	return UpdateMMDBWithPath("")
++}
++
++func UpdateMMDBWithPath(path string) (err error) {
++	defaultPath := C.Path.MMDB()
++	path, active, err := geoUpdatePath(path, defaultPath)
++	if err != nil {
++		return err
++	}
++	vehicle := resource.NewHTTPVehicle(geodata.MmdbUrl(), path, "", nil, defaultHttpTimeout, 0)
+ 	var oldHash utils.HashType
+ 	if buf, err := os.ReadFile(vehicle.Path()); err == nil {
+ 		oldHash = utils.MakeHash(buf)
+@@ -67,16 +166,30 @@
+ 	}
+ 	_ = instance.Close()
+ 
+-	defer mmdb.ReloadIP()
+-	mmdb.IPInstance().Reader.Close() //  mmdb is loaded with mmap, so it needs to be closed before overwriting the file
++	if active {
++		defer mmdb.ReloadIP()
++		// 已有有效默认库可能正被 mmap；缺失或损坏的旧库不能交给会退出进程的 IPInstance。
++		if mmdb.Verify(defaultPath) {
++			_ = mmdb.IPInstance().Reader.Close()
++		}
++	}
+ 	if err = vehicle.Write(data); err != nil {
+ 		return fmt.Errorf("can't save MMDB database file: %w", err)
+ 	}
+ 	return nil
+ }
+ 
+-func UpdateASN() (err error) {
+-	vehicle := resource.NewHTTPVehicle(geodata.ASNUrl(), C.Path.ASN(), "", nil, defaultHttpTimeout, 0)
++func UpdateASN() error {
++	return UpdateASNWithPath("")
++}
++
++func UpdateASNWithPath(path string) (err error) {
++	defaultPath := C.Path.ASN()
++	path, active, err := geoUpdatePath(path, defaultPath)
++	if err != nil {
++		return err
++	}
++	vehicle := resource.NewHTTPVehicle(geodata.ASNUrl(), path, "", nil, defaultHttpTimeout, 0)
+ 	var oldHash utils.HashType
+ 	if buf, err := os.ReadFile(vehicle.Path()); err == nil {
+ 		oldHash = utils.MakeHash(buf)
+@@ -98,18 +211,33 @@
+ 	}
+ 	_ = instance.Close()
+ 
+-	defer mmdb.ReloadASN()
+-	mmdb.ASNInstance().Reader.Close() //  mmdb is loaded with mmap, so it needs to be closed before overwriting the file
++	if active {
++		defer mmdb.ReloadASN()
++		if mmdb.Verify(defaultPath) {
++			_ = mmdb.ASNInstance().Reader.Close()
++		}
++	}
+ 	if err = vehicle.Write(data); err != nil {
+ 		return fmt.Errorf("can't save ASN database file: %w", err)
+ 	}
+ 	return nil
+ }
+ 
+-func UpdateGeoIp() (err error) {
++func UpdateGeoIp() error {
++	return UpdateGeoIpWithPath("")
++}
++
++func UpdateGeoIpWithPath(path string) (err error) {
++	path, active, err := geoUpdatePath(path, C.Path.GeoIP())
++	if err != nil {
++		return err
++	}
+ 	geoLoader, err := geodata.GetGeoDataLoader("standard")
+-
+-	vehicle := resource.NewHTTPVehicle(geodata.GeoIpUrl(), C.Path.GeoIP(), "", nil, defaultHttpTimeout, 0)
++	if err != nil {
++		return err
++	}
++
++	vehicle := resource.NewHTTPVehicle(geodata.GeoIpUrl(), path, "", nil, defaultHttpTimeout, 0)
+ 	var oldHash utils.HashType
+ 	if buf, err := os.ReadFile(vehicle.Path()); err == nil {
+ 		oldHash = utils.MakeHash(buf)
+@@ -129,17 +257,30 @@
+ 		return fmt.Errorf("invalid GeoIP database file: %s", err)
+ 	}
+ 
+-	defer geodata.ClearGeoIPCache()
++	if active {
++		defer geodata.ClearGeoIPCache()
++	}
+ 	if err = vehicle.Write(data); err != nil {
+ 		return fmt.Errorf("can't save GeoIP database file: %w", err)
+ 	}
+ 	return nil
+ }
+ 
+-func UpdateGeoSite() (err error) {
++func UpdateGeoSite() error {
++	return UpdateGeoSiteWithPath("")
++}
++
++func UpdateGeoSiteWithPath(path string) (err error) {
++	path, active, err := geoUpdatePath(path, C.Path.GeoSite())
++	if err != nil {
++		return err
++	}
+ 	geoLoader, err := geodata.GetGeoDataLoader("standard")
+-
+-	vehicle := resource.NewHTTPVehicle(geodata.GeoSiteUrl(), C.Path.GeoSite(), "", nil, defaultHttpTimeout, 0)
++	if err != nil {
++		return err
++	}
++
++	vehicle := resource.NewHTTPVehicle(geodata.GeoSiteUrl(), path, "", nil, defaultHttpTimeout, 0)
+ 	var oldHash utils.HashType
+ 	if buf, err := os.ReadFile(vehicle.Path()); err == nil {
+ 		oldHash = utils.MakeHash(buf)
+@@ -159,7 +300,9 @@
+ 		return fmt.Errorf("invalid GeoSite database file: %s", err)
+ 	}
+ 
+-	defer geodata.ClearGeoSiteCache()
++	if active {
++		defer geodata.ClearGeoSiteCache()
++	}
+ 	if err = vehicle.Write(data); err != nil {
+ 		return fmt.Errorf("can't save GeoSite database file: %w", err)
+ 	}
+diff --git a/constant/adapters.go b/constant/adapters.go
+--- a/constant/adapters.go
++++ b/constant/adapters.go
+@@ -7,6 +7,7 @@
+ 	"net"
+ 	"net/netip"
+ 	"sync"
++	"sync/atomic"
+ 	"time"
+ 
+ 	N "github.com/metacubex/mihomo/common/net"
+@@ -64,6 +65,19 @@
+ 	DefaultTLSTimeout = DefaultTCPTimeout
+ 	DefaultTestURL    = "https://www.gstatic.com/generate_204"
+ )
++
++var testURLOverride atomic.Pointer[string]
++
++func SetTestURL(url string) {
++	testURLOverride.Store(&url)
++}
++
++func TestURL() string {
++	if url := testURLOverride.Load(); url != nil {
++		return *url
++	}
++	return DefaultTestURL
++}
+ 
+ var ErrNotSupport = errors.New("no support")
+ 
+diff --git a/constant/features/android.go b/constant/features/android.go
+new file mode 100644
+--- /dev/null
++++ b/constant/features/android.go
+@@ -0,0 +1,5 @@
++//go:build android
++
++package features
++
++const Android = true
+diff --git a/constant/features/android_stub.go b/constant/features/android_stub.go
+new file mode 100644
+--- /dev/null
++++ b/constant/features/android_stub.go
+@@ -0,0 +1,5 @@
++//go:build !android
++
++package features
++
++const Android = false
+diff --git a/constant/features/ohos.go b/constant/features/ohos.go
+new file mode 100644
+--- /dev/null
++++ b/constant/features/ohos.go
+@@ -0,0 +1,5 @@
++//go:build ohos
++
++package features
++
++const OHOS = true
+diff --git a/constant/features/ohos_stub.go b/constant/features/ohos_stub.go
+new file mode 100644
+--- /dev/null
++++ b/constant/features/ohos_stub.go
+@@ -0,0 +1,5 @@
++//go:build !ohos
++
++package features
++
++const OHOS = false
+diff --git a/dns/patch_android.go b/dns/patch_android.go
+deleted file mode 100644
+--- a/dns/patch_android.go
++++ /dev/null
+@@ -1,37 +0,0 @@
+-//go:build android && cmfa
+-
+-package dns
+-
+-import (
+-	"github.com/metacubex/mihomo/component/resolver"
+-)
+-
+-var systemResolver []dnsClient
+-
+-func FlushCacheWithDefaultResolver() {
+-	resolver.ClearCache()
+-	resolver.ResetConnection()
+-}
+-
+-func UpdateSystemDNS(addr []string) {
+-	if len(addr) == 0 {
+-		systemResolver = nil
+-	}
+-
+-	ns := make([]NameServer, 0, len(addr))
+-	for _, d := range addr {
+-		ns = append(ns, NameServer{Addr: d})
+-	}
+-
+-	systemResolver = transform(ns, nil)
+-}
+-
+-func (c *systemClient) getDnsClients() ([]dnsClient, error) {
+-	return systemResolver, nil
+-}
+-
+-func (c *systemClient) ResetConnection() {
+-	for _, r := range systemResolver {
+-		r.ResetConnection()
+-	}
+-}
+diff --git a/dns/system_common.go b/dns/system_common.go
+--- a/dns/system_common.go
++++ b/dns/system_common.go
+@@ -1,4 +1,4 @@
+-//go:build !(android && cmfa)
++//go:build !(android && cmfa) && !(linux && !android && ohos)
+ 
+ package dns
+ 
+diff --git a/dns/system_injected.go b/dns/system_injected.go
+new file mode 100644
+--- /dev/null
++++ b/dns/system_injected.go
+@@ -0,0 +1,54 @@
++//go:build (android && cmfa) || (linux && !android && ohos)
++
++package dns
++
++import (
++	"strings"
++	"sync"
++
++	"github.com/metacubex/mihomo/component/resolver"
++)
++
++var injectedSystemDNS struct {
++	sync.RWMutex
++	clients []dnsClient
++}
++
++func FlushCacheWithDefaultResolver() {
++	resolver.ClearCache()
++	resolver.ResetConnection()
++}
++
++// UpdateSystemDNS 用给定的 host:port 地址替换注入的 UDP DNS 服务器。
++func UpdateSystemDNS(addr []string) {
++	ns := make([]NameServer, 0, len(addr))
++	for _, d := range addr {
++		// 桥接层拆分空字符串后会得到一个空条目。
++		if d = strings.TrimSpace(d); d != "" {
++			ns = append(ns, NameServer{Addr: d})
++		}
++	}
++
++	var clients []dnsClient
++	if len(ns) > 0 {
++		clients = transform(ns, nil)
++	}
++
++	injectedSystemDNS.Lock()
++	injectedSystemDNS.clients = clients
++	injectedSystemDNS.Unlock()
++}
++
++func (c *systemClient) getDnsClients() ([]dnsClient, error) {
++	injectedSystemDNS.RLock()
++	defer injectedSystemDNS.RUnlock()
++	// 更新只替换切片，不修改已发布的快照。
++	return injectedSystemDNS.clients, nil
++}
++
++func (c *systemClient) ResetConnection() {
++	clients, _ := c.getDnsClients()
++	for _, r := range clients {
++		r.ResetConnection()
++	}
++}
+diff --git a/dns/system_injected_test.go b/dns/system_injected_test.go
+new file mode 100644
+--- /dev/null
++++ b/dns/system_injected_test.go
+@@ -0,0 +1,81 @@
++//go:build (android && cmfa) || (linux && !android && ohos)
++
++package dns
++
++import (
++	"context"
++	"strings"
++	"sync"
++	"testing"
++
++	D "github.com/miekg/dns"
++)
++
++func TestInjectedSystemDNS(t *testing.T) {
++	t.Cleanup(func() { UpdateSystemDNS(nil) })
++	c := newSystemClient()
++	c.defaultNS = []dnsClient{newRCodeClient("name_error")}
++
++	UpdateSystemDNS([]string{"192.0.2.1:53", "", " [2001:db8::1]:5353 "})
++	if got, want := c.Address(), "system(udp://192.0.2.1:53,udp://[2001:db8::1]:5353)"; got != want {
++		t.Fatalf("Address() = %q, want %q", got, want)
++	}
++	snapshot, err := c.getDnsClients()
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	UpdateSystemDNS([]string{"192.0.2.2:53"})
++	if got, want := c.Address(), "system(udp://192.0.2.2:53)"; got != want {
++		t.Fatalf("Address() = %q after replacement, want %q", got, want)
++	}
++	if got, want := snapshot[0].Address(), "udp://192.0.2.1:53"; got != want {
++		t.Fatalf("prior snapshot changed: %q, want %q", got, want)
++	}
++
++	for _, addr := range [][]string{nil, {}, strings.Split("", ","), {" ", ""}} {
++		UpdateSystemDNS([]string{"192.0.2.1:53"})
++		UpdateSystemDNS(addr)
++		if clients, err := c.getDnsClients(); clients != nil || err != nil {
++			t.Fatalf("getDnsClients() after UpdateSystemDNS(%#v) = %v, %v; want nil, nil", addr, clients, err)
++		}
++		if got, want := c.Address(), "system[defaultNS](rcode://name_error)"; got != want {
++			t.Fatalf("Address() = %q after clearing, want %q", got, want)
++		}
++		query := new(D.Msg).SetQuestion("example.test.", D.TypeA)
++		reply, err := c.ExchangeContext(context.Background(), query)
++		if err != nil || reply == nil || reply.Rcode != D.RcodeNameError {
++			t.Fatalf("ExchangeContext() did not use defaultNS: %v, %v", reply, err)
++		}
++	}
++}
++
++func TestInjectedSystemDNSConcurrent(t *testing.T) {
++	t.Cleanup(func() { UpdateSystemDNS(nil) })
++	c := newSystemClient()
++	var wg sync.WaitGroup
++	start := make(chan struct{})
++	for _, work := range []func(){
++		func() { UpdateSystemDNS([]string{"192.0.2.1:53", "[2001:db8::1]:53"}) },
++		func() { UpdateSystemDNS(nil) },
++		func() {
++			switch got := c.Address(); got {
++			case "system()", "system(udp://192.0.2.1:53,udp://[2001:db8::1]:53)":
++			default:
++				t.Errorf("Address() returned an unexpected snapshot: %q", got)
++			}
++		},
++		c.ResetConnection,
++	} {
++		wg.Add(1)
++		go func(work func()) {
++			defer wg.Done()
++			<-start
++			for i := 0; i < 100; i++ {
++				work()
++			}
++		}(work)
++	}
++	close(start)
++	wg.Wait()
++}
+diff --git a/hub/executor/executor.go b/hub/executor/executor.go
+--- a/hub/executor/executor.go
++++ b/hub/executor/executor.go
+@@ -14,6 +14,7 @@
+ 	"github.com/metacubex/mihomo/adapter"
+ 	"github.com/metacubex/mihomo/adapter/inbound"
+ 	"github.com/metacubex/mihomo/adapter/outboundgroup"
++	"github.com/metacubex/mihomo/common/atomic"
+ 	"github.com/metacubex/mihomo/component/auth"
+ 	"github.com/metacubex/mihomo/component/ca"
+ 	"github.com/metacubex/mihomo/component/dialer"
+@@ -44,6 +45,12 @@
+ 
+ var mux sync.Mutex
+ 
++type ProviderLoadedHook func(providerName string)
++
++// DefaultProviderLoadedHook 在 Provider 初始化成功后调用；使用 Store 注册，传 nil 清除。
++// 回调可能并发执行，且不能等待 ApplyConfig 返回。
++var DefaultProviderLoadedHook atomic.TypedValue[ProviderLoadedHook]
++
+ func readConfig(path string) ([]byte, error) {
+ 	if _, err := os.Stat(path); os.IsNotExist(err) {
+ 		return nil, err
+@@ -104,8 +111,11 @@
+ 	updateGeneral(cfg.General, true)
+ 	updateDNS(cfg.DNS, cfg.General.IPv6)
+ 	updateNTP(cfg.NTP) // initialize NTP after DNS because an NTP server may be a hostname.
+-	updateListeners(cfg.General, cfg.Listeners, force)
+-	updateTun(cfg.General) // tun should not care "force"
++	// OHOS 由桥接管理入站监听，并使用系统 VPN 提供的 TUN。
++	if !bridgeOwnsListeners {
++		updateListeners(cfg.General, cfg.Listeners, force)
++		updateTun(cfg.General) // tun should not care "force"
++	}
+ 	updateIPTables(cfg)
+ 	updateTunnels(cfg.Tunnels)
+ 
+@@ -335,6 +345,10 @@
+ 					log.Errorln("initial rule provider %s error: %v", name, err)
+ 				}
+ 			}
++			return
++		}
++		if hook := DefaultProviderLoadedHook.Load(); hook != nil {
++			hook(name)
+ 		}
+ 	}
+ 
+diff --git a/hub/executor/ohos.go b/hub/executor/ohos.go
+new file mode 100644
+--- /dev/null
++++ b/hub/executor/ohos.go
+@@ -0,0 +1,5 @@
++//go:build ohos
++
++package executor
++
++const bridgeOwnsListeners = true
+diff --git a/hub/executor/ohos_stub.go b/hub/executor/ohos_stub.go
+new file mode 100644
+--- /dev/null
++++ b/hub/executor/ohos_stub.go
+@@ -0,0 +1,5 @@
++//go:build !ohos
++
++package executor
++
++const bridgeOwnsListeners = false
+diff --git a/listener/listener.go b/listener/listener.go
+--- a/listener/listener.go
++++ b/listener/listener.go
+@@ -512,10 +512,9 @@
+ 		}
+ 	}()
+ 
+-	if tunConf.Equal(LastTunConf) {
+-		if tunLister != nil { // some default value in dialer maybe changed when config reload, reset at here
+-			tunLister.OnReload()
+-		}
++	if tunLister != nil && tunConf.Equal(LastTunConf) {
++		// 重载配置后，拨号器的默认值可能已变化。
++		tunLister.OnReload()
+ 		return
+ 	}
+ 
+@@ -725,5 +724,7 @@
+ }
+ 
+ func Cleanup() {
++	tunMux.Lock()
++	defer tunMux.Unlock()
+ 	closeTunListener()
+ }
+diff --git a/listener/stop.go b/listener/stop.go
+new file mode 100644
+--- /dev/null
++++ b/listener/stop.go
+@@ -0,0 +1,78 @@
++package listener
++
++// StopListener 关闭核心管理的普通代理监听和 TUN，不触及桥接单独持有的 VPN TUN。
++func StopListener() {
++	socksMux.Lock()
++	if socksListener != nil {
++		_ = socksListener.Close()
++		socksListener = nil
++	}
++	if socksUDPListener != nil {
++		_ = socksUDPListener.Close()
++		socksUDPListener = nil
++	}
++	socksMux.Unlock()
++
++	httpMux.Lock()
++	if httpListener != nil {
++		_ = httpListener.Close()
++		httpListener = nil
++	}
++	httpMux.Unlock()
++
++	redirMux.Lock()
++	if redirListener != nil {
++		_ = redirListener.Close()
++		redirListener = nil
++	}
++	if redirUDPListener != nil {
++		_ = redirUDPListener.Close()
++		redirUDPListener = nil
++	}
++	redirMux.Unlock()
++
++	tproxyMux.Lock()
++	if tproxyListener != nil {
++		_ = tproxyListener.Close()
++		tproxyListener = nil
++	}
++	if tproxyUDPListener != nil {
++		_ = tproxyUDPListener.Close()
++		tproxyUDPListener = nil
++	}
++	tproxyMux.Unlock()
++
++	mixedMux.Lock()
++	if mixedListener != nil {
++		_ = mixedListener.Close()
++		mixedListener = nil
++	}
++	if mixedUDPLister != nil {
++		_ = mixedUDPLister.Close()
++		mixedUDPLister = nil
++	}
++	mixedMux.Unlock()
++
++	Cleanup()
++
++	ssMux.Lock()
++	if shadowSocksListener != nil {
++		_ = shadowSocksListener.Close()
++		shadowSocksListener = nil
++	}
++	ssMux.Unlock()
++
++	vmessMux.Lock()
++	if vmessListener != nil {
++		_ = vmessListener.Close()
++		vmessListener = nil
++	}
++	vmessMux.Unlock()
++
++	tuicMux.Lock()
++	if tuicListener != nil {
++		_ = tuicListener.Close()
++		tuicListener = nil
++	}
++	tuicMux.Unlock()
++}
+diff --git a/tunnel/statistic/manager.go b/tunnel/statistic/manager.go
+--- a/tunnel/statistic/manager.go
++++ b/tunnel/statistic/manager.go
+@@ -10,6 +10,11 @@
+ )
+ 
+ var DefaultManager *Manager
++
++type RequestNotify func(c Tracker)
++
++// DefaultRequestNotify 在连接登记后调用；使用 Store 注册，传 nil 清除。回调可能并发执行。
++var DefaultRequestNotify atomic.TypedValue[RequestNotify]
+ 
+ func init() {
+ 	DefaultManager = &Manager{
+@@ -33,12 +38,23 @@
+ 	downloadBlip  atomic.Int64
+ 	uploadTotal   atomic.Int64
+ 	downloadTotal atomic.Int64
+-	pid           int32
+-	memory        uint64
++
++	proxyUploadTemp    atomic.Int64
++	proxyDownloadTemp  atomic.Int64
++	proxyUploadBlip    atomic.Int64
++	proxyDownloadBlip  atomic.Int64
++	proxyUploadTotal   atomic.Int64
++	proxyDownloadTotal atomic.Int64
++
++	pid    int32
++	memory uint64
+ }
+ 
+ func (m *Manager) Join(c Tracker) {
+ 	m.connections.Store(c.ID(), c)
++	if notify := DefaultRequestNotify.Load(); notify != nil {
++		notify(c)
++	}
+ }
+ 
+ func (m *Manager) Leave(c Tracker) {
+@@ -58,12 +74,29 @@
+ 	})
+ }
+ 
++// 未提供链路的流量按基线的空链处理：只有明确命中 DIRECT 才排除。
+ func (m *Manager) PushUploaded(size int64) {
++	m.pushUploaded("", size)
++}
++
++func (m *Manager) pushUploaded(lastChain string, size int64) {
++	if lastChain != "DIRECT" {
++		m.proxyUploadTemp.Add(size)
++		m.proxyUploadTotal.Add(size)
++	}
+ 	m.uploadTemp.Add(size)
+ 	m.uploadTotal.Add(size)
+ }
+ 
+ func (m *Manager) PushDownloaded(size int64) {
++	m.pushDownloaded("", size)
++}
++
++func (m *Manager) pushDownloaded(lastChain string, size int64) {
++	if lastChain != "DIRECT" {
++		m.proxyDownloadTemp.Add(size)
++		m.proxyDownloadTotal.Add(size)
++	}
+ 	m.downloadTemp.Add(size)
+ 	m.downloadTotal.Add(size)
+ }
+@@ -74,6 +107,20 @@
+ 
+ func (m *Manager) Total() (up, down int64) {
+ 	return m.uploadTotal.Load(), m.downloadTotal.Load()
++}
++
++func (m *Manager) NowTraffic(onlyProxy bool) (up, down int64) {
++	if onlyProxy {
++		return m.proxyUploadBlip.Load(), m.proxyDownloadBlip.Load()
++	}
++	return m.Now()
++}
++
++func (m *Manager) TotalTraffic(onlyProxy bool) (up, down int64) {
++	if onlyProxy {
++		return m.proxyUploadTotal.Load(), m.proxyDownloadTotal.Load()
++	}
++	return m.Total()
+ }
+ 
+ func (m *Manager) Memory() uint64 {
+@@ -110,14 +157,27 @@
+ 	m.downloadTemp.Store(0)
+ 	m.downloadBlip.Store(0)
+ 	m.downloadTotal.Store(0)
++
++	m.proxyUploadTemp.Store(0)
++	m.proxyUploadBlip.Store(0)
++	m.proxyUploadTotal.Store(0)
++	m.proxyDownloadTemp.Store(0)
++	m.proxyDownloadBlip.Store(0)
++	m.proxyDownloadTotal.Store(0)
++}
++
++func (m *Manager) updateBlips() {
++	m.uploadBlip.Store(m.uploadTemp.Swap(0))
++	m.downloadBlip.Store(m.downloadTemp.Swap(0))
++	m.proxyUploadBlip.Store(m.proxyUploadTemp.Swap(0))
++	m.proxyDownloadBlip.Store(m.proxyDownloadTemp.Swap(0))
+ }
+ 
+ func (m *Manager) handle() {
+ 	ticker := time.NewTicker(time.Second)
+ 
+ 	for range ticker.C {
+-		m.uploadBlip.Store(m.uploadTemp.Swap(0))
+-		m.downloadBlip.Store(m.downloadTemp.Swap(0))
++		m.updateBlips()
+ 	}
+ }
+ 
+diff --git a/tunnel/statistic/tracker.go b/tunnel/statistic/tracker.go
+--- a/tunnel/statistic/tracker.go
++++ b/tunnel/statistic/tracker.go
+@@ -53,7 +53,7 @@
+ 	n, err := tt.Conn.Read(b)
+ 	download := int64(n)
+ 	if tt.pushToManager {
+-		tt.manager.PushDownloaded(download)
++		tt.manager.pushDownloaded(tt.Chains().Last(), download)
+ 	}
+ 	tt.DownloadTotal.Add(download)
+ 	return n, err
+@@ -63,7 +63,7 @@
+ 	err = tt.Conn.ReadBuffer(buffer)
+ 	download := int64(buffer.Len())
+ 	if tt.pushToManager {
+-		tt.manager.PushDownloaded(download)
++		tt.manager.pushDownloaded(tt.Chains().Last(), download)
+ 	}
+ 	tt.DownloadTotal.Add(download)
+ 	return
+@@ -72,7 +72,7 @@
+ func (tt *tcpTracker) UnwrapReader() (io.Reader, []N.CountFunc) {
+ 	return tt.Conn, []N.CountFunc{func(download int64) {
+ 		if tt.pushToManager {
+-			tt.manager.PushDownloaded(download)
++			tt.manager.pushDownloaded(tt.Chains().Last(), download)
+ 		}
+ 		tt.DownloadTotal.Add(download)
+ 	}}
+@@ -82,7 +82,7 @@
+ 	n, err := tt.Conn.Write(b)
+ 	upload := int64(n)
+ 	if tt.pushToManager {
+-		tt.manager.PushUploaded(upload)
++		tt.manager.pushUploaded(tt.Chains().Last(), upload)
+ 	}
+ 	tt.UploadTotal.Add(upload)
+ 	return n, err
+@@ -92,7 +92,7 @@
+ 	upload := int64(buffer.Len())
+ 	err = tt.Conn.WriteBuffer(buffer)
+ 	if tt.pushToManager {
+-		tt.manager.PushUploaded(upload)
++		tt.manager.pushUploaded(tt.Chains().Last(), upload)
+ 	}
+ 	tt.UploadTotal.Add(upload)
+ 	return
+@@ -101,7 +101,7 @@
+ func (tt *tcpTracker) UnwrapWriter() (io.Writer, []N.CountFunc) {
+ 	return tt.Conn, []N.CountFunc{func(upload int64) {
+ 		if tt.pushToManager {
+-			tt.manager.PushUploaded(upload)
++			tt.manager.pushUploaded(tt.Chains().Last(), upload)
+ 		}
+ 		tt.UploadTotal.Add(upload)
+ 	}}
+@@ -137,10 +137,10 @@
+ 
+ 	if pushToManager {
+ 		if uploadTotal > 0 {
+-			manager.PushUploaded(uploadTotal)
++			manager.pushUploaded(t.Chains().Last(), uploadTotal)
+ 		}
+ 		if downloadTotal > 0 {
+-			manager.PushDownloaded(downloadTotal)
++			manager.pushDownloaded(t.Chains().Last(), downloadTotal)
+ 		}
+ 	}
+ 
+@@ -173,7 +173,7 @@
+ 	n, addr, err := ut.PacketConn.ReadFrom(b)
+ 	download := int64(n)
+ 	if ut.pushToManager {
+-		ut.manager.PushDownloaded(download)
++		ut.manager.pushDownloaded(ut.Chains().Last(), download)
+ 	}
+ 	ut.DownloadTotal.Add(download)
+ 	return n, addr, err
+@@ -183,7 +183,7 @@
+ 	data, put, addr, err = ut.PacketConn.WaitReadFrom()
+ 	download := int64(len(data))
+ 	if ut.pushToManager {
+-		ut.manager.PushDownloaded(download)
++		ut.manager.pushDownloaded(ut.Chains().Last(), download)
+ 	}
+ 	ut.DownloadTotal.Add(download)
+ 	return
+@@ -193,7 +193,7 @@
+ 	n, err := ut.PacketConn.WriteTo(b, addr)
+ 	upload := int64(n)
+ 	if ut.pushToManager {
+-		ut.manager.PushUploaded(upload)
++		ut.manager.pushUploaded(ut.Chains().Last(), upload)
+ 	}
+ 	ut.UploadTotal.Add(upload)
+ 	return n, err
+@@ -229,10 +229,10 @@
+ 
+ 	if pushToManager {
+ 		if uploadTotal > 0 {
+-			manager.PushUploaded(uploadTotal)
++			manager.pushUploaded(ut.Chains().Last(), uploadTotal)
+ 		}
+ 		if downloadTotal > 0 {
+-			manager.PushDownloaded(downloadTotal)
++			manager.pushDownloaded(ut.Chains().Last(), downloadTotal)
+ 		}
+ 	}
+ 
+diff --git a/tunnel/statistic/traffic_test.go b/tunnel/statistic/traffic_test.go
+new file mode 100644
+--- /dev/null
++++ b/tunnel/statistic/traffic_test.go
+@@ -0,0 +1,162 @@
++package statistic
++
++import (
++	"net"
++	"testing"
++
++	"github.com/metacubex/mihomo/common/buf"
++	C "github.com/metacubex/mihomo/constant"
++)
++
++func TestTrafficViews(t *testing.T) {
++	m := new(Manager)
++	check := func(name string, read func() (int64, int64), wantUp, wantDown int64) {
++		t.Helper()
++		if up, down := read(); up != wantUp || down != wantDown {
++			t.Errorf("%s = (%d, %d), want (%d, %d)", name, up, down, wantUp, wantDown)
++		}
++	}
++	nowAll := func() (int64, int64) { return m.NowTraffic(false) }
++	nowProxy := func() (int64, int64) { return m.NowTraffic(true) }
++	totalAll := func() (int64, int64) { return m.TotalTraffic(false) }
++	totalProxy := func() (int64, int64) { return m.TotalTraffic(true) }
++
++	m.pushUploaded("DIRECT", 5)
++	m.pushDownloaded("DIRECT", 7)
++	m.pushUploaded("proxy", 11)
++	m.pushDownloaded("proxy", 13)
++	m.PushUploaded(17)
++	m.PushDownloaded(19)
++
++	check("Now before tick", m.Now, 0, 0)
++	check("proxy Now before tick", nowProxy, 0, 0)
++	check("Total", m.Total, 33, 39)
++	check("all traffic total", totalAll, 33, 39)
++	check("proxy traffic total", totalProxy, 28, 32)
++	if s := m.Snapshot(); s.UploadTotal != 33 || s.DownloadTotal != 39 {
++		t.Errorf("Snapshot totals = (%d, %d), want (33, 39)", s.UploadTotal, s.DownloadTotal)
++	}
++
++	m.updateBlips()
++	check("Now after tick", m.Now, 33, 39)
++	check("all traffic now", nowAll, 33, 39)
++	check("proxy traffic now", nowProxy, 28, 32)
++	m.updateBlips()
++	check("all traffic now in idle window", nowAll, 0, 0)
++	check("proxy traffic now in idle window", nowProxy, 0, 0)
++	check("all traffic total after idle window", totalAll, 33, 39)
++	check("proxy traffic total after idle window", totalProxy, 28, 32)
++
++	m.pushUploaded("proxy", 23)
++	m.pushDownloaded("proxy", 29)
++	m.updateBlips()
++	m.pushUploaded("proxy", 31)
++	m.pushDownloaded("proxy", 37)
++	m.ResetStatistic()
++	check("all traffic now after reset", nowAll, 0, 0)
++	check("proxy traffic now after reset", nowProxy, 0, 0)
++	check("all traffic total after reset", totalAll, 0, 0)
++	check("proxy traffic total after reset", totalProxy, 0, 0)
++	m.updateBlips()
++	check("all traffic now at first tick after reset", nowAll, 0, 0)
++	check("proxy traffic now at first tick after reset", nowProxy, 0, 0)
++}
++
++func TestTrackerTrafficAccounting(t *testing.T) {
++	for _, tc := range []struct {
++		name     string
++		chain    C.Chain
++		push     bool
++		proxied  bool
++	}{
++		{"direct through group", C.Chain{"DIRECT", "group"}, true, false},
++		{"proxy through group", C.Chain{"node", "DIRECT"}, true, true},
++		{"empty chain", nil, true, true},
++		{"manager accounting disabled", C.Chain{"node"}, false, false},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			m := new(Manager)
++			tcp := NewTCPTracker(&trafficTCPConn{chain: tc.chain}, m, &C.Metadata{}, nil, 2, 3, tc.push)
++			udp := NewUDPTracker(&trafficUDPConn{chain: tc.chain}, m, &C.Metadata{}, nil, 5, 7, tc.push)
++			check := func(name string, up, down, wantUp, wantDown int64) {
++				t.Helper()
++				if up != wantUp || down != wantDown {
++					t.Errorf("%s = (%d, %d), want (%d, %d)", name, up, down, wantUp, wantDown)
++				}
++			}
++			checkPath := func(name string, wantUp, wantDown int64) {
++				t.Helper()
++				var allUp, allDown, proxyUp, proxyDown int64
++				if tc.push {
++					allUp, allDown = wantUp, wantDown
++				}
++				if tc.proxied {
++					proxyUp, proxyDown = wantUp, wantDown
++				}
++				up, down := m.Total()
++				check(name+" all", up, down, allUp, allDown)
++				up, down = m.TotalTraffic(true)
++				check(name+" proxy", up, down, proxyUp, proxyDown)
++				m.ResetStatistic()
++			}
++			checkPath("initial bytes", 7, 10)
++
++			_, _ = tcp.Write(make([]byte, 11))
++			_, _ = tcp.Read(make([]byte, 13))
++			checkPath("TCP read/write", 11, 13)
++
++			_ = tcp.WriteBuffer(buf.As(make([]byte, 17)))
++			buffer := buf.NewSize(19)
++			defer buffer.Release()
++			if err := tcp.ReadBuffer(buffer); err != nil {
++				t.Fatal(err)
++			}
++			checkPath("TCP buffers", 17, 19)
++
++			_, writeCounts := tcp.UnwrapWriter()
++			_, readCounts := tcp.UnwrapReader()
++			writeCounts[0](23)
++			readCounts[0](29)
++			checkPath("TCP unwrap", 23, 29)
++
++			_, _ = udp.WriteTo(make([]byte, 31), nil)
++			_, _, _ = udp.ReadFrom(make([]byte, 37))
++			_, _, _, _ = udp.WaitReadFrom()
++			checkPath("UDP read/write/wait", 31, 78)
++
++			check("TCP connection totals", tcp.UploadTotal.Load(), tcp.DownloadTotal.Load(), 53, 64)
++			check("UDP connection totals", udp.UploadTotal.Load(), udp.DownloadTotal.Load(), 36, 85)
++		})
++	}
++}
++
++type trafficTCPConn struct {
++	C.Conn
++	chain C.Chain
++}
++
++func (c *trafficTCPConn) Chains() C.Chain                { return c.chain }
++func (*trafficTCPConn) ProviderChains() C.Chain          { return nil }
++func (*trafficTCPConn) RemoteDestination() string        { return "" }
++func (*trafficTCPConn) Read(p []byte) (int, error)        { return len(p), nil }
++func (*trafficTCPConn) Write(p []byte) (int, error)       { return len(p), nil }
++func (*trafficTCPConn) ReadBuffer(b *buf.Buffer) error    { _, err := b.Write(make([]byte, 19)); return err }
++func (*trafficTCPConn) WriteBuffer(b *buf.Buffer) error   { b.Release(); return nil }
++
++type trafficUDPConn struct {
++	C.PacketConn
++	chain C.Chain
++}
++
++func (c *trafficUDPConn) Chains() C.Chain               { return c.chain }
++func (*trafficUDPConn) ProviderChains() C.Chain         { return nil }
++func (*trafficUDPConn) RemoteDestination() string       { return "" }
++func (*trafficUDPConn) ReadFrom(p []byte) (int, net.Addr, error) {
++	return len(p), nil, nil
++}
++func (*trafficUDPConn) WriteTo(p []byte, _ net.Addr) (int, error) {
++	return len(p), nil
++}
++func (*trafficUDPConn) WaitReadFrom() ([]byte, func(), net.Addr, error) {
++	return make([]byte, 41), nil, nil, nil
++}
+diff --git a/tunnel/tunnel.go b/tunnel/tunnel.go
+--- a/tunnel/tunnel.go
++++ b/tunnel/tunnel.go
+@@ -214,6 +214,23 @@
+ // Proxies return all proxies
+ func Proxies() map[string]C.Proxy {
+ 	return proxies
++}
++
++// ProxiesWithProviders 返回合并后的代理映射，provider 的代理可以覆盖同名的顶层代理。
++func ProxiesWithProviders() map[string]C.Proxy {
++	configMux.RLock()
++	defer configMux.RUnlock()
++
++	allProxies := make(map[string]C.Proxy, len(proxies))
++	for name, proxy := range proxies {
++		allProxies[name] = proxy
++	}
++	for _, p := range providers {
++		for _, proxy := range p.Proxies() {
++			allProxies[proxy.Name()] = proxy
++		}
++	}
++	return allProxies
+ }
+ 
+ // Providers return all compatible providers

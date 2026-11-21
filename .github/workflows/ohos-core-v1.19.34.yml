@@ -1,0 +1,108 @@
+name: 构建鸿蒙 ARM64 mihomo v1.19.34
+
+on:
+  push:
+    branches: [ci/ohos-core-v1.19.34]
+    paths: [.github/workflows/ohos-core-v1.19.34.yml, '.github/patches/mihomo-v1.19.34-*.patch']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 获取升级补丁
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          path: recipe
+      - name: 获取固定版本的桥接源码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: jerry-271828/ClashBox
+          ref: 6f5fa14dbf8cb5008dd96ef4f0237f567e4703e4
+          persist-credentials: false
+          path: source
+      - name: 准备鸿蒙 NDK
+        id: ohos
+        uses: openharmony-rs/setup-ohos-sdk@b312caf8a43bb836aa24c08f65f97e1f09a89cad
+        with:
+          version: 5.0.0
+          components: native
+      - name: 准备引导 Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: '1.24.13'
+          cache: false
+      - name: 获取固定依赖并构建定制 Go
+        shell: bash
+        env:
+          GOTOOLCHAIN: local
+        run: |
+          fetch_revision() {
+            local url="$1" revision="$2" target="$3"
+            git init --quiet "$target"
+            git -C "$target" fetch --quiet --depth 1 "$url" "$revision"
+            git -C "$target" checkout --quiet --detach FETCH_HEAD
+            test "$(git -C "$target" rev-parse HEAD)" = "$revision"
+          }
+          git -C source apply --whitespace=error "$GITHUB_WORKSPACE/recipe/.github/patches/mihomo-v1.19.34-bridge.patch"
+          fetch_revision https://github.com/MetaCubeX/mihomo.git 0455d0d28c4526937380505153e65a843d8612e8 source/proxy_core/src/flclash/core
+          git -C source/proxy_core/src/flclash/core apply --whitespace=error "$GITHUB_WORKSPACE/recipe/.github/patches/mihomo-v1.19.34-core.patch"
+          fetch_revision https://github.com/moodyhunter/go-tls-mode-gd.git 0136c5054dec5322f49a4d5431a610b972c44b4f "$RUNNER_TEMP/go-ohos"
+          grep -q tlsmodegd "$RUNNER_TEMP/go-ohos/src/cmd/go/internal/work/build.go"
+          export GOROOT_BOOTSTRAP="$(go env GOROOT)"
+          (cd "$RUNNER_TEMP/go-ohos/src" && bash make.bash)
+          "$RUNNER_TEMP/go-ohos/bin/go" version
+      - name: 编译并校验 ARM64 共享库
+        working-directory: source/proxy_core/src/flclash
+        shell: bash
+        env:
+          OHOS_NATIVE: ${{ steps.ohos.outputs.ohos_sdk_native }}
+          GOTOOLCHAIN: local
+        run: |
+          test -d "$OHOS_NATIVE/sysroot"
+          go_ohos="$RUNNER_TEMP/go-ohos/bin/go"
+          (cd core && "$go_ohos" test -tags ohos ./dns ./tunnel/statistic)
+          mv go.mod "$RUNNER_TEMP/flclash-original.go.mod"
+          mv go.sum "$RUNNER_TEMP/flclash-original.go.sum"
+          "$go_ohos" mod init core
+          "$go_ohos" mod edit -go=1.26 \
+            -require=github.com/likuai2010/ohos-napi@v1.0.3 \
+            -require=github.com/metacubex/mihomo@v1.19.34 \
+            -require=github.com/samber/lo@v1.53.0 \
+            -replace=github.com/metacubex/mihomo=./core \
+            -replace=google.golang.org/protobuf=github.com/metacubex/protobuf-go@v0.0.0-20260306035419-7ceee0674686
+          GOFLAGS=-tags=ohos,with_gvisor "$go_ohos" mod tidy
+          export GOOS=linux GOARCH=arm64 CGO_ENABLED=1
+          export CC="$OHOS_NATIVE/llvm/bin/clang" CXX="$OHOS_NATIVE/llvm/bin/clang++" CGO_AR="$OHOS_NATIVE/llvm/bin/llvm-ar"
+          export CGO_CFLAGS="--target=aarch64-linux-ohos --sysroot=$OHOS_NATIVE/sysroot -D__MUSL__ -fPIC -Wno-error"
+          export CGO_LDFLAGS="--target=aarch64-linux-ohos --sysroot=$OHOS_NATIVE/sysroot -fuse-ld=lld"
+          output="$GITHUB_WORKSPACE/ohos-core-artifact"
+          mkdir -p "$output"
+          "$go_ohos" build -mod=mod -tlsmodegd -buildmode=c-shared -tags 'ohos with_gvisor' -trimpath -ldflags '-s -w -X github.com/metacubex/mihomo/constant.Version=1.19.34' -o "$output/libflclash.so" ./
+          cd "$output"
+          header=$(readelf -h libflclash.so)
+          dynamic=$(readelf -d libflclash.so)
+          symbols=$(readelf --dyn-syms --wide libflclash.so)
+          grep -F 'ELF64' <<< "$header"
+          grep -F 'AArch64' <<< "$header"
+          grep -F 'DYN (Shared object file)' <<< "$header"
+          grep -E '[[:space:]]InitializeModule$' <<< "$symbols"
+          for lib in libhilog_ndk.z.so libace_napi.z.so libc.so; do
+            grep -F "Shared library: [$lib]" <<< "$dynamic"
+          done
+          if grep -F '(TEXTREL)' <<< "$dynamic"; then exit 1; fi
+          sha256sum libflclash.so > SHA256SUMS
+      - name: 上传升级验证产物
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ohos-core-v1.19.34-arm64
+          path: |
+            ohos-core-artifact/libflclash.so
+            ohos-core-artifact/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7

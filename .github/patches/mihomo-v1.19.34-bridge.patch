@@ -1,0 +1,209 @@
+diff --git a/proxy_core/src/flclash/common.go b/proxy_core/src/flclash/common.go
+--- a/proxy_core/src/flclash/common.go
++++ b/proxy_core/src/flclash/common.go
+@@ -242,7 +242,7 @@
+ 	}
+ 
+ 	if configParams.TestURL != nil {
+-		constant.DefaultTestURL = *configParams.TestURL
++		constant.SetTestURL(*configParams.TestURL)
+ 	}
+ 	for idx := range targetConfig.ProxyGroup {
+ 		targetConfig.ProxyGroup[idx]["url"] = ""
+diff --git a/proxy_core/src/flclash/go.mod b/proxy_core/src/flclash/go.mod
+--- a/proxy_core/src/flclash/go.mod
++++ b/proxy_core/src/flclash/go.mod
+@@ -4,11 +4,11 @@
+ 
+ replace github.com/metacubex/mihomo => ./core
+ 
+-replace github.com/metacubex/gvisor => ./gvisor-ohos
++replace google.golang.org/protobuf => github.com/metacubex/protobuf-go v0.0.0-20260306035419-7ceee0674686
+ 
+ require (
+ 	github.com/likuai2010/ohos-napi v1.0.3
+-	github.com/metacubex/mihomo v1.17.1
++	github.com/metacubex/mihomo v1.19.34
+ )
+ 
+ require github.com/samber/lo v1.53.0
+diff --git a/proxy_core/src/flclash/hub.go b/proxy_core/src/flclash/hub.go
+--- a/proxy_core/src/flclash/hub.go
++++ b/proxy_core/src/flclash/hub.go
+@@ -8,6 +8,7 @@
+ 	"runtime"
+ 	"sort"
+ 	"strconv"
++	"sync"
+ 	"time"
+ 
+ 	"github.com/metacubex/mihomo/adapter"
+@@ -217,7 +218,7 @@
+ 			return false, nil
+ 		}
+ 
+-		delay, err := proxy.URLTest(ctx, constant.DefaultTestURL, expectedStatus)
++		delay, err := proxy.URLTest(ctx, constant.TestURL(), expectedStatus)
+ 		if err != nil || delay == 0 {
+ 			delayData.Value = -1
+ 			data, _ := json.Marshal(delayData)
+@@ -437,9 +438,12 @@
+ }
+ 
+ var reqeustList = []statistic.Tracker{}
++var requestAppendMu sync.Mutex
+ 
+ func init() {
+-	adapter.UrlTestHook = func(url string, name string, delay uint16) {
++	// 应用配置时桥接持有 runLock，ApplyConfig 会等待 Provider 初始化。
++	// 异步发送事件，避免初始化回调等待同样需要 runLock 的 sendMessage。
++	adapter.UrlTestHook.Store(func(_ string, name string, delay uint16) {
+ 		delayData := &Delay{
+ 			Name: name,
+ 		}
+@@ -448,22 +452,24 @@
+ 		} else {
+ 			delayData.Value = int32(delay)
+ 		}
+-		sendMessage(Message{
++		go sendMessage(Message{
+ 			Type: DelayMessage,
+ 			Data: delayData,
+ 		})
+-	}
+-	statistic.DefaultRequestNotify = func(c statistic.Tracker) {
++	})
++	statistic.DefaultRequestNotify.Store(func(c statistic.Tracker) {
++		requestAppendMu.Lock()
+ 		reqeustList = append(reqeustList, c)
+-		sendMessage(Message{
++		requestAppendMu.Unlock()
++		go sendMessage(Message{
+ 			Type: RequestMessage,
+ 			Data: c,
+ 		})
+-	}
+-	executor.DefaultProviderLoadedHook = func(providerName string) {
+-		sendMessage(Message{
++	})
++	executor.DefaultProviderLoadedHook.Store(func(providerName string) {
++		go sendMessage(Message{
+ 			Type: LoadedMessage,
+ 			Data: providerName,
+ 		})
+-	}
+-}
++	})
++}
+diff --git a/proxy_core/src/flclash/lib_linux.go b/proxy_core/src/flclash/lib_linux.go
+--- a/proxy_core/src/flclash/lib_linux.go
++++ b/proxy_core/src/flclash/lib_linux.go
+@@ -17,8 +17,6 @@
+ 	"syscall"
+ 	"time"
+ 
+-	"net"
+-
+ 	"github.com/metacubex/mihomo/component/dialer"
+ 	"github.com/metacubex/mihomo/component/iface"
+ 	"github.com/metacubex/mihomo/component/process"
+@@ -263,84 +261,21 @@
+ 	}()
+ }
+ 
+-type NetIpMacInfo struct {
+-	IpAddress  NetAddress `json:"ipAddress"`
+-	Iface      string     `json:"iface"`
+-	MacAddress string     `json:"macAddress"`
+-}
+-type NetAddress struct {
+-	Address string `json:"address"` // IP地址
+-	Family  int    `json:"family"`  // 地址族：4(IPv4)或6(IPv6)
+-	Port    int    `json:"port"`    // 端口号（如果有）
+-}
+-
+-func (info *NetIpMacInfo) ToNetInterface() (*net.Interface, error) {
+-	// 解析 MAC 地址
+-	var mac net.HardwareAddr
+-	if info.MacAddress != "" {
+-		var err error
+-		mac, err = net.ParseMAC(info.MacAddress)
+-		if err != nil {
+-			return nil, fmt.Errorf("parse MAC address failed: %w", err)
+-		}
+-	}
+-
+-	// 获取接口索引（通过接口名）
+-	var index int
+-	if info.Iface != "" {
+-		iface, err := net.InterfaceByName(info.Iface)
+-		if err == nil && iface != nil {
+-			index = iface.Index
+-		}
+-	}
+-
+-	return &net.Interface{
+-		Index:        index,
+-		MTU:          1500, // 默认值，你可能需要从其他地方获取
+-		Name:         info.Iface,
+-		HardwareAddr: mac,
+-		Flags:        getInterfaceFlags(info), // 需要实现这个函数
+-	}, nil
+-}
+-func getInterfaceFlags(info *NetIpMacInfo) net.Flags {
+-	var flags net.Flags
+-
+-	// 如果 MAC 地址存在，通常接口是启用的
+-	if info.MacAddress != "" {
+-		flags |= net.FlagUp
+-		flags |= net.FlagBroadcast
+-		flags |= net.FlagMulticast
+-	}
+-
+-	// 检查是否为回环接口
+-	if info.Iface == "lo" || info.Iface == "lo0" {
+-		flags |= net.FlagLoopback
+-	}
+-	return flags
+-}
+-
+ func SetInterfaces(paramsString string) error {
+-	var interfaces []net.Interface
+-	var infos []NetIpMacInfo
+-	err := json.Unmarshal([]byte(paramsString), infos)
+-	if err != nil {
++	// getIpNeighTable 返回邻居 IP 和 MAC；只有 iface 指向本机接口。
++	var neighbors []struct {
++		Iface string `json:"iface"`
++	}
++	if err := json.Unmarshal([]byte(paramsString), &neighbors); err != nil {
+ 		return err
+ 	}
+-	seen := make(map[string]bool) // 去重
+-	for _, info := range infos {
+-		if seen[info.Iface] {
+-			continue
+-		}
+-		ifa, err := info.ToNetInterface()
+-		if err != nil {
+-			continue // 或者返回错误
+-		}
+-
+-		if ifa != nil {
+-			interfaces = append(interfaces, *ifa)
+-			seen[info.Iface] = true
+-		}
+-	}
+-	iface.SetNetInterfaces(interfaces)
+-	return nil
+-}
++	if neighbors == nil {
++		return errors.New("网卡注入参数必须是邻居表数组")
++	}
++
++	names := make([]string, 0, len(neighbors))
++	for _, neighbor := range neighbors {
++		names = append(names, neighbor.Iface)
++	}
++	return iface.SetNetInterfacesByName(names)
++}
