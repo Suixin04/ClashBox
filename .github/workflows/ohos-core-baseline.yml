@@ -17,8 +17,8 @@ jobs:
       - name: 获取固定版本的桥接源码
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          repository: xiaobaigroup/ClashBox
-          ref: e036a6a3097192ff74987ce7306eea2a03d6a3ac
+          repository: jerry-271828/ClashBox
+          ref: 6f5fa14dbf8cb5008dd96ef4f0237f567e4703e4
           persist-credentials: false
           path: source
       - name: 准备鸿蒙 NDK
